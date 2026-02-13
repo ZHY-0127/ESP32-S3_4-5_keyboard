@@ -1,0 +1,106 @@
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
+
+// =======================
+// BLE UUID（需與控制端一致）
+// =======================
+#define SERVICE_UUID        "12345678-1234-1234-1234-1234567890ab"
+#define CHARACTERISTIC_UUID "abcd1234-5678-1234-5678-1234567890ab"
+
+// =======================
+// LED 設定
+// =======================
+const int ledPin = 5;
+uint8_t brightness = 0;
+
+// =======================
+// BLE 物件
+// =======================
+BLECharacteristic *pCharacteristic;
+bool deviceConnected = false;
+
+// =======================
+// PWM 設定
+// =======================
+const int pwmChannel = 0;
+const int pwmFreq = 5000;
+const int pwmResolution = 8;
+
+// =======================
+// 連線回呼
+// =======================
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) {
+    deviceConnected = true;
+    Serial.println("Client Connected");
+  }
+
+  void onDisconnect(BLEServer* pServer) {
+    deviceConnected = false;
+    Serial.println("Client Disconnected");
+    BLEDevice::startAdvertising();  // 自動重播
+  }
+};
+
+// =======================
+// 收到亮度資料時
+// =======================
+class BrightnessCallback : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pCharacteristic) {
+
+    std::string value = pCharacteristic->getValue();
+
+    if (value.length() > 0) {
+
+      brightness = value[0];
+
+      ledcWrite(pwmChannel, brightness);
+
+      Serial.print("Brightness Received: ");
+      Serial.println(brightness);
+    }
+  }
+};
+
+// =======================
+// SETUP
+// =======================
+void setup() {
+
+  Serial.begin(115200);
+
+  // PWM 初始化
+  ledcSetup(pwmChannel, pwmFreq, pwmResolution);
+  ledcAttachPin(ledPin, pwmChannel);
+
+  // BLE 初始化
+  BLEDevice::init("SmartLamp");
+  BLEServer *pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  pCharacteristic = pService->createCharacteristic(
+                      CHARACTERISTIC_UUID,
+                      BLECharacteristic::PROPERTY_WRITE
+                    );
+
+  pCharacteristic->setCallbacks(new BrightnessCallback());
+
+  pService->start();
+
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->start();
+
+  Serial.println("Lamp BLE Ready");
+}
+
+// =======================
+// LOOP
+// =======================
+void loop() {
+  delay(100);
+}
