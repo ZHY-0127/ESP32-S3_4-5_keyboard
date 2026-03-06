@@ -6,16 +6,19 @@
 #include <BLEClient.h>
 
 // =======================
-// USB HID
+// USB HID（讓 ESP32-S3 可被電腦辨識為鍵盤）
 // =======================
 USBHIDKeyboard Keyboard;
+const bool kEnableHidDemo = false; // 預設關閉，避免誤觸電腦音量
 
 // =======================
 // CE-11 亮度控制
 // =======================
-const int ce11Pin = 4;   // ADC腳位
-int brightness = 0;
-int lastBrightness = -1;
+const int ce11Pin = 4;   // ADC 腳位（接旋鈕/可變電阻輸入）
+int brightness = 0;      // 目前亮度（0~255）
+int lastStableBrightness = -1; // 上一次通過 deadband 的亮度
+int lastSentBrightness = -1;   // 上一次成功送出的亮度
+const int kBrightnessDeadband = 2; // 小於此差值視為雜訊，不傳送
 
 // =======================
 // BLE 設定（與檯燈一致）
@@ -23,46 +26,72 @@ int lastBrightness = -1;
 #define SERVICE_UUID        "12345678-1234-1234-1234-1234567890ab"
 #define CHARACTERISTIC_UUID "abcd1234-5678-1234-5678-1234567890ab"
 
-BLEClient* pClient;
-BLERemoteCharacteristic* pRemoteCharacteristic;
+BLEClient* pClient = nullptr;
+BLERemoteCharacteristic* pRemoteCharacteristic = nullptr;
 bool deviceConnected = false;
+bool wasDeviceConnected = false;
+unsigned long lastReconnectAttemptMs = 0;
+const unsigned long kReconnectIntervalMs = 3000;
+
+class MyClientCallbacks : public BLEClientCallbacks {
+  void onConnect(BLEClient* pclient) override {
+    deviceConnected = true;
+    Serial.println("BLE connected");
+  }
+
+  void onDisconnect(BLEClient* pclient) override {
+    deviceConnected = false;
+    pRemoteCharacteristic = nullptr;
+    Serial.println("BLE disconnected");
+  }
+};
 
 // =======================
-// BLE 連線
+// BLE 連線（掃描符合 UUID 的檯燈並建立連線）
 // =======================
-void connectToLamp() {
-
-  BLEDevice::init("");
-  pClient = BLEDevice::createClient();
+bool connectToLamp() {
 
   BLEScan* pBLEScan = BLEDevice::getScan();
-  pBLEScan->setActiveScan(true);
-  BLEScanResults results = pBLEScan->start(5);
+  pBLEScan->setActiveScan(true);           // 主動掃描，拿到較完整廣播資料
+  BLEScanResults results = pBLEScan->start(3, false); // 掃描 3 秒
 
   for (int i = 0; i < results.getCount(); i++) {
     BLEAdvertisedDevice device = results.getDevice(i);
 
+    // 只連線有廣播指定 Service UUID 的裝置，避免誤連其他 BLE 裝置
     if (device.haveServiceUUID() &&
         device.isAdvertisingService(BLEUUID(SERVICE_UUID))) {
 
-      pClient->connect(&device);
-      BLERemoteService* pRemoteService =
-        pClient->getService(SERVICE_UUID);
-
-      if (pRemoteService != nullptr) {
-        pRemoteCharacteristic =
-          pRemoteService->getCharacteristic(CHARACTERISTIC_UUID);
-
-        if (pRemoteCharacteristic != nullptr) {
-          deviceConnected = true;
-          Serial.println("Connected to Lamp");
-          return;
-        }
+      Serial.println("Lamp candidate found, connecting...");
+      if (!pClient->connect(&device)) {
+        Serial.println("Connect failed");
+        continue;
       }
+
+      BLERemoteService* pRemoteService = pClient->getService(SERVICE_UUID);
+      if (pRemoteService == nullptr) {
+        Serial.println("Service not found");
+        pClient->disconnect();
+        continue;
+      }
+
+      pRemoteCharacteristic =
+        pRemoteService->getCharacteristic(CHARACTERISTIC_UUID);
+      if (pRemoteCharacteristic == nullptr) {
+        Serial.println("Characteristic not found");
+        pClient->disconnect();
+        continue;
+      }
+
+      deviceConnected = true;
+      lastSentBrightness = -1; // 新連線後強制同步目前亮度
+      Serial.println("Connected to Lamp");
+      return true;
     }
   }
 
   Serial.println("Lamp not found");
+  return false;
 }
 
 // =======================
@@ -72,14 +101,19 @@ void setup() {
 
   Serial.begin(115200);
 
-  // USB HID
+  // USB HID 初始化（開啟 USB 與鍵盤功能）
   USB.begin();
   Keyboard.begin();
 
-  // ADC
+  // ADC 腳位初始化
   pinMode(ce11Pin, INPUT);
 
-  // BLE
+  // BLE Client 初始化與 callback
+  BLEDevice::init("");
+  pClient = BLEDevice::createClient();
+  pClient->setClientCallbacks(new MyClientCallbacks());
+
+  // 啟動時先嘗試一次連線
   connectToLamp();
 }
 
@@ -88,27 +122,45 @@ void setup() {
 // =======================
 void loop() {
 
+  // 偵測剛連線成功的瞬間，強制下一次傳送目前亮度
+  if (deviceConnected && !wasDeviceConnected) {
+    lastSentBrightness = -1;
+  }
+  wasDeviceConnected = deviceConnected;
+
+  // 未連線時，每隔固定時間重試
+  if ((!deviceConnected || pRemoteCharacteristic == nullptr) &&
+      millis() - lastReconnectAttemptMs >= kReconnectIntervalMs) {
+    lastReconnectAttemptMs = millis();
+    connectToLamp();
+  }
+
   // ===== 讀取 CE-11 =====
+  // ESP32 ADC 預設 12-bit，範圍 0~4095
   int adcValue = analogRead(ce11Pin);
+  // 轉換成 8-bit 亮度，與檯燈端 PWM 解析度一致
   brightness = map(adcValue, 0, 4095, 0, 255);
 
-  // ===== 若亮度變化才傳送 =====
-  if (brightness != lastBrightness) {
+  // ===== 若亮度變化超過 deadband 才傳送 =====
+  if (abs(brightness - lastStableBrightness) >= kBrightnessDeadband) {
+    lastStableBrightness = brightness;
 
     Serial.print("Brightness: ");
     Serial.println(brightness);
 
-    // USB HID 傳送 (示範：按下 F13~F24 可自訂)
-    Keyboard.press(KEY_MEDIA_VOLUME_UP);
-    delay(10);
-    Keyboard.releaseAll();
-
-    // BLE 傳送亮度給檯燈
-    if (deviceConnected && pRemoteCharacteristic) {
-      pRemoteCharacteristic->writeValue(&brightness, 1);
+    // USB HID 示範（預設關閉）
+    if (kEnableHidDemo) {
+      Keyboard.press(KEY_MEDIA_VOLUME_UP);
+      delay(10);
+      Keyboard.releaseAll();
     }
 
-    lastBrightness = brightness;
+    // BLE 傳送亮度給檯燈
+    if (deviceConnected && pRemoteCharacteristic && brightness != lastSentBrightness) {
+      uint8_t txBrightness = static_cast<uint8_t>(brightness);
+      pRemoteCharacteristic->writeValue(&txBrightness, 1);
+      lastSentBrightness = brightness;
+    }
   }
 
   delay(50);
